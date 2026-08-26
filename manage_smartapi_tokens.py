@@ -1,14 +1,14 @@
 """Manage the SmartAPI token list used by 02_Test_websocket_v2.py.
 
 Commands:
-    ADD EXCHANGE TOKEN
+    ADD EXCHANGE TOKEN LEVEL
     REMOVE EXCHANGE TOKEN
     LIST
     HELP
     EXIT
 
 Examples:
-    ADD NSE 99926000
+    ADD NSE 99926000 24322
     REMOVE NSE 99926000
 """
 
@@ -29,6 +29,11 @@ def load_tokens():
         tokens = json.load(file)
     if not isinstance(tokens, list):
         raise ValueError("token file must contain a JSON list")
+    if tokens == [[]]:
+        return []
+    for item in tokens:
+        if not isinstance(item, dict) or not {"exchange", "token", "level"}.issubset(item):
+            raise ValueError("each token must contain exchange, token, and level")
     return tokens
 
 
@@ -53,18 +58,29 @@ def save_tokens(tokens):
         raise
 
 
-def add_token(tokens, exchange, token):
+def add_token(tokens, exchange, token, level):
     exchange = exchange.upper()
     if exchange not in SUPPORTED_EXCHANGES:
         raise ValueError(f"unsupported exchange: {exchange}")
-    item = {"exchange": exchange, "token": str(token)}
-    if item not in tokens:
+    item = {"exchange": exchange, "token": str(token), "level": float(level)}
+    existing = next(
+        (current for current in tokens if current["exchange"] == exchange and current["token"] == str(token)),
+        None,
+    )
+    if existing is None:
         tokens.append(item)
+    else:
+        existing["level"] = item["level"]
 
 
 def remove_token(tokens, exchange, token):
-    item = {"exchange": exchange.upper(), "token": str(token)}
-    tokens[:] = [current for current in tokens if current != item]
+    exchange = exchange.upper()
+    token = str(token)
+    tokens[:] = [
+        current
+        for current in tokens
+        if not (current.get("exchange") == exchange and current.get("token") == token)
+    ]
 
 
 def list_tokens(tokens):
@@ -72,15 +88,17 @@ def list_tokens(tokens):
         print("No instruments configured.")
         return
     for item in tokens:
-        print(f"{item['exchange']:<4} {item['token']}")
+        print(f"{item['exchange']:<4} {item['token']:<10} level={item['level']}")
 
 
 def show_help():
-    print("ADD EXCHANGE TOKEN")
-    print("  ADD NSE 99926000")
-    print("  ADD NFO 123456")
+    print("ADD EXCHANGE TOKEN LEVEL")
+    print("  ADD NSE 99926000 24322")
+    print("  ADD MCX 576363 400")
+    print("  ADD NFO 123456 100")
     print("REMOVE EXCHANGE TOKEN")
     print("  REMOVE NSE 99926000")
+    print("  REMOVE MCX 576363")
     print("  REMOVE NFO 123456")
     print("LIST")
     print("HELP")
@@ -106,14 +124,16 @@ def main():
 
         try:
             tokens = load_tokens()
-            if action in ("ADD", "REMOVE") and len(parts) == 3:
-                exchange, token = parts[1], parts[2]
-                if action == "ADD":
-                    add_token(tokens, exchange, token)
-                else:
-                    remove_token(tokens, exchange, token)
+            if action == "ADD" and len(parts) == 4:
+                exchange, token, level = parts[1], parts[2], parts[3]
+                add_token(tokens, exchange, token, level)
                 save_tokens(tokens)
-                print(f"{action.title()} {exchange.upper()} {token}")
+                print(f"Added {exchange.upper()} {token} level={float(level)}")
+            elif action == "REMOVE" and len(parts) == 3:
+                exchange, token = parts[1], parts[2]
+                remove_token(tokens, exchange, token)
+                save_tokens(tokens)
+                print(f"Removed {exchange.upper()} {token}")
             elif action == "LIST" and len(parts) == 1:
                 list_tokens(tokens)
             elif action == "HELP" and len(parts) == 1:

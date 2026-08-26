@@ -14,11 +14,11 @@ Features:
 
 Commands:
 
-    ADD NSE 3045
-    ADD NSE 26000
-    ADD BSE 999190
-    ADD NFO 64325
-    ADD MCX 123456
+    ADD NSE 3045 24322
+    ADD NSE 26000 24322
+    ADD BSE 999190 77500
+    ADD NFO 64325 24322
+    ADD MCX 123456 8350
 
     REMOVE NSE 3045
 
@@ -111,6 +111,7 @@ token_lock = threading.Lock()
 #
 subscribed_tokens = {}
 latest_prices = {}
+crossing_states = {}
 last_token_file_signature = None
 
 
@@ -209,6 +210,7 @@ def on_data(wsapp, message):
 
         with token_lock:
             latest_prices[(exchange_type, str(token))] = ltp
+        evaluate_crossing(exchange_type, str(token), ltp)
 
     except Exception as e:
 
@@ -223,7 +225,41 @@ def load_token_list():
         tokens = json.load(file)
     if not isinstance(tokens, list):
         raise ValueError("token file must contain a JSON list")
-    return [(item["exchange"].upper(), str(item["token"])) for item in tokens]
+    if tokens == [[]]:
+        return []
+    for item in tokens:
+        if not isinstance(item, dict) or not {"exchange", "token", "level"}.issubset(item):
+            raise ValueError("each token must contain exchange, token, and level")
+    return [
+        {
+            "exchange": item["exchange"].upper(),
+            "token": str(item["token"]),
+            "level": float(item["level"]),
+        }
+        for item in tokens
+    ]
+
+
+def evaluate_crossing(exchange_type, token, price):
+    key = (exchange_type, token)
+    with token_lock:
+        state = crossing_states.setdefault(key, {"previous": None, "armed": True})
+        previous = state["previous"]
+        level = state.get("level")
+        if level is None:
+            return
+        if not state["armed"]:
+            if abs(price - level) >= 50:
+                state["armed"] = True
+                print(f"REARMED {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} at {price:.2f}")
+        elif previous is not None:
+            if previous <= level < price:
+                print(f"UP {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
+                state["armed"] = False
+            elif previous >= level > price:
+                print(f"DOWN {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
+                state["armed"] = False
+        state["previous"] = price
 
 
 def sync_token_list():
@@ -240,7 +276,12 @@ def sync_token_list():
         print("TOKEN FILE ERROR:", error)
         return
 
-    desired = {(EXCHANGE_MAP[exchange], token) for exchange, token in tokens}
+    desired = {(EXCHANGE_MAP[item["exchange"]], item["token"]) for item in tokens}
+    with token_lock:
+        for item in tokens:
+            key = (EXCHANGE_MAP[item["exchange"]], item["token"])
+            state = crossing_states.setdefault(key, {"previous": None, "armed": True})
+            state["level"] = item["level"]
     with token_lock:
         current = {
             (exchange_type, token)
@@ -263,7 +304,8 @@ def print_prices_loop():
             print(f"\n{timestamp} | CURRENT TOKEN PRICES")
             with token_lock:
                 prices = dict(latest_prices)
-            for exchange_name, token in tokens:
+            for item in tokens:
+                exchange_name, token = item["exchange"], item["token"]
                 exchange_type = EXCHANGE_MAP[exchange_name]
                 price = prices.get((exchange_type, token), "waiting")
                 formatted_price = f"{price:.2f}" if isinstance(price, float) else price
