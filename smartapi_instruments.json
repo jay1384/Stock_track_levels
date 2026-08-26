@@ -1,0 +1,24 @@
+[
+  {
+    "index": "Nifty",
+    "underlying": {
+      "exchange": "NSE",
+      "token": "99926000"
+    }
+  },
+  {
+    "index": "Sensex",
+    "underlying": {
+      "exchange": "BFO",
+      "token": "99919000"
+    },
+    "call": {
+      "exchange": "BFO",
+      "token": "827827"
+    },
+    "put": {
+      "exchange": "BFO",
+      "token": "830015"
+    }
+  }
+]

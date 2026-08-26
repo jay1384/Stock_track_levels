@@ -1,0 +1,18 @@
+[
+  {
+    "exchange": "NSE",
+    "token": "99926000"
+  },
+  {
+    "exchange": "BSE",
+    "token": "99919000"
+  },
+  {
+    "exchange": "MCX",
+    "token": "576530"
+  },
+  {
+    "exchange": "BFO",
+    "token": "830015"
+  }
+]
