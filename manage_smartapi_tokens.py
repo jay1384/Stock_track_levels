@@ -2,14 +2,14 @@
 
 Commands:
     ADD EXCHANGE TOKEN LEVEL
-    REMOVE EXCHANGE TOKEN
+    REMOVE EXCHANGE TOKEN LEVEL
     LIST
     HELP
     EXIT
 
 Examples:
     ADD NSE 99926000 24322
-    REMOVE NSE 99926000
+    REMOVE NSE 99926000 24322
 """
 
 import json
@@ -64,22 +64,30 @@ def add_token(tokens, exchange, token, level):
         raise ValueError(f"unsupported exchange: {exchange}")
     item = {"exchange": exchange, "token": str(token), "level": float(level)}
     existing = next(
-        (current for current in tokens if current["exchange"] == exchange and current["token"] == str(token)),
+        (
+            current for current in tokens
+            if current["exchange"] == exchange
+            and current["token"] == str(token)
+            and float(current["level"]) == float(level)
+        ),
         None,
     )
     if existing is None:
         tokens.append(item)
-    else:
-        existing["level"] = item["level"]
 
 
-def remove_token(tokens, exchange, token):
+def remove_token(tokens, exchange, token, level):
     exchange = exchange.upper()
     token = str(token)
+    level = float(level)
     tokens[:] = [
         current
         for current in tokens
-        if not (current.get("exchange") == exchange and current.get("token") == token)
+        if not (
+            current.get("exchange") == exchange
+            and current.get("token") == token
+            and float(current.get("level")) == level
+        )
     ]
 
 
@@ -96,10 +104,10 @@ def show_help():
     print("  ADD NSE 99926000 24322")
     print("  ADD MCX 576363 400")
     print("  ADD NFO 123456 100")
-    print("REMOVE EXCHANGE TOKEN")
-    print("  REMOVE NSE 99926000")
-    print("  REMOVE MCX 576363")
-    print("  REMOVE NFO 123456")
+    print("REMOVE EXCHANGE TOKEN LEVEL")
+    print("  REMOVE NSE 99926000 24322")
+    print("  REMOVE MCX 576363 400")
+    print("  REMOVE NFO 123456 100")
     print("LIST")
     print("HELP")
     print("EXIT")
@@ -129,11 +137,11 @@ def main():
                 add_token(tokens, exchange, token, level)
                 save_tokens(tokens)
                 print(f"Added {exchange.upper()} {token} level={float(level)}")
-            elif action == "REMOVE" and len(parts) == 3:
-                exchange, token = parts[1], parts[2]
-                remove_token(tokens, exchange, token)
+            elif action == "REMOVE" and len(parts) == 4:
+                exchange, token, level = parts[1], parts[2], parts[3]
+                remove_token(tokens, exchange, token, level)
                 save_tokens(tokens)
-                print(f"Removed {exchange.upper()} {token}")
+                print(f"Removed {exchange.upper()} {token} level={float(level)}")
             elif action == "LIST" and len(parts) == 1:
                 list_tokens(tokens)
             elif action == "HELP" and len(parts) == 1:

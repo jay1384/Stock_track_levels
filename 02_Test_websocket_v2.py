@@ -14,13 +14,14 @@ Features:
 
 Commands:
 
-    ADD NSE 3045 24322
-    ADD NSE 26000 24322
-    ADD BSE 999190 77500
-    ADD NFO 64325 24322
-    ADD MCX 123456 8350
+    ADD NSE 99926000 24322
+    ADD NSE 99926000 24231
+    ADD BSE 99919000 74322
+    ADD BSE 99919000 74231
+    ADD MCX 576363 400
+    ADD MCX 576363 423
 
-    REMOVE NSE 3045
+    REMOVE NSE 99926000 24322
 
     LIST
 
@@ -112,6 +113,7 @@ token_lock = threading.Lock()
 subscribed_tokens = {}
 latest_prices = {}
 crossing_states = {}
+token_levels = {}
 last_token_file_signature = None
 
 
@@ -241,25 +243,24 @@ def load_token_list():
 
 
 def evaluate_crossing(exchange_type, token, price):
-    key = (exchange_type, token)
+    token_key = (exchange_type, token)
     with token_lock:
-        state = crossing_states.setdefault(key, {"previous": None, "armed": True})
-        previous = state["previous"]
-        level = state.get("level")
-        if level is None:
-            return
-        if not state["armed"]:
-            if abs(price - level) >= 50:
-                state["armed"] = True
-                print(f"REARMED {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} at {price:.2f}")
-        elif previous is not None:
-            if previous <= level < price:
-                print(f"UP {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
-                state["armed"] = False
-            elif previous >= level > price:
-                print(f"DOWN {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
-                state["armed"] = False
-        state["previous"] = price
+        for level in token_levels.get(token_key, set()):
+            key = (exchange_type, token, level)
+            state = crossing_states.setdefault(key, {"previous": None, "armed": True})
+            previous = state["previous"]
+            if not state["armed"]:
+                if abs(price - level) >= 50:
+                    state["armed"] = True
+                    print(f"REARMED {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} at {price:.2f} for level={level:.2f}")
+            elif previous is not None:
+                if previous <= level < price:
+                    print(f"UP {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
+                    state["armed"] = False
+                elif previous >= level > price:
+                    print(f"DOWN {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type)} {token} | price={price:.2f} level={level:.2f}")
+                    state["armed"] = False
+            state["previous"] = price
 
 
 def sync_token_list():
@@ -278,10 +279,14 @@ def sync_token_list():
 
     desired = {(EXCHANGE_MAP[item["exchange"]], item["token"]) for item in tokens}
     with token_lock:
+        token_levels.clear()
         for item in tokens:
             key = (EXCHANGE_MAP[item["exchange"]], item["token"])
-            state = crossing_states.setdefault(key, {"previous": None, "armed": True})
-            state["level"] = item["level"]
+            token_levels.setdefault(key, set()).add(item["level"])
+            crossing_states.setdefault(
+                (key[0], key[1], item["level"]),
+                {"previous": None, "armed": True},
+            )
     with token_lock:
         current = {
             (exchange_type, token)
@@ -309,7 +314,10 @@ def print_prices_loop():
                 exchange_type = EXCHANGE_MAP[exchange_name]
                 price = prices.get((exchange_type, token), "waiting")
                 formatted_price = f"{price:.2f}" if isinstance(price, float) else price
-                print(f"{exchange_name:<4} | {token:<10} | LTP = {formatted_price}")
+                print(
+                    f"{exchange_name:<4} | {token:<10} | "
+                    f"LEVEL = {item['level']:.2f} | LTP = {formatted_price}"
+                )
         except Exception as error:
             print("PRICE REPORT ERROR:", error)
 
