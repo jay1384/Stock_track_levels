@@ -235,6 +235,7 @@ def load_token_list():
     return [
         {
             "exchange": item["exchange"].upper(),
+            "symbol": item.get("symbol", ""),
             "token": str(item["token"]),
             "level": float(item["level"]),
         }
@@ -315,8 +316,9 @@ def print_prices_loop():
                 price = prices.get((exchange_type, token), "waiting")
                 formatted_price = f"{price:.2f}" if isinstance(price, float) else price
                 print(
-                    f"{exchange_name:<4} | {token:<10} | "
-                    f"LEVEL = {item['level']:.2f} | LTP = {formatted_price}"
+                    f"{exchange_name:<4} | {item['symbol']:<24} | "
+                    f"{token:<10} | LTP = {formatted_price} | "
+                    f"LEVEL = {item['level']:.2f}"
                 )
         except Exception as error:
             print("PRICE REPORT ERROR:", error)
@@ -521,6 +523,11 @@ def list_tokens():
     print("CURRENTLY SUBSCRIBED TOKENS")
     print("=" * 70)
 
+    configured_tokens = {
+        (EXCHANGE_MAP[item["exchange"]], item["token"]): item
+        for item in load_token_list()
+    }
+
     with token_lock:
 
         if not subscribed_tokens:
@@ -540,9 +547,15 @@ def list_tokens():
                 print(exchange_name)
 
                 for token in sorted(tokens):
-
+                    item = configured_tokens.get((exchange_type, token), {})
+                    symbol = item.get("symbol", "")
+                    level = item.get("level", "")
+                    price = latest_prices.get((exchange_type, token), "waiting")
+                    formatted_price = f"{price:.2f}" if isinstance(price, float) else price
                     print(
-                        f"    {token}"
+                        f"    {EXCHANGE_NAME_MAP.get(exchange_type, exchange_type):<4} | "
+                        f"{symbol:<24} | {token:<10} | LTP = {formatted_price} | "
+                        f"LEVEL = {level}"
                     )
 
     print()
