@@ -1,14 +1,29 @@
 [
   {
-    "symbol": "Nifty 50",
-    "exchange": "NSE",
-    "token": "99926000",
-    "level": 25965.0
+    "symbol": "SENSEX",
+    "exchange": "BSE",
+    "token": "99919000",
+    "level": 76850.0,
+    "enabled": true,
+    "activated": true,
+    "ltp": 76831.56
   },
   {
-    "symbol": "NIFTY01SEP2624100CE",
-    "exchange": "NFO",
-    "token": "46989",
-    "level": 200.0
+    "symbol": "SENSEX",
+    "exchange": "BSE",
+    "token": "99919000",
+    "level": 76880.0,
+    "enabled": true,
+    "activated": true,
+    "ltp": null
+  },
+  {
+    "symbol": "SENSEX",
+    "exchange": "BSE",
+    "token": "99919000",
+    "level": 76830.0,
+    "enabled": true,
+    "activated": true,
+    "ltp": null
   }
 ]

@@ -1,12 +1,23 @@
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, stream_with_context, url_for
 import json
 import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 
 app = Flask(__name__)
+
+
+@app.after_request
+def no_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 BASE_DIR = Path(__file__).parent
 TOKENS_FILE = BASE_DIR / "smartapi_tokens.json"
 EXPIRY_DB = BASE_DIR / "expiry_date.db"
@@ -25,6 +36,20 @@ DEFAULT_EXPIRY = {
 DEFAULT_EXCHANGE = {"Nifty": "NSE", "Sensex": "BSE", "Crudeoil": "MCX"}
 
 
+def normalize_token_entry(item):
+    if not isinstance(item, dict):
+        return item
+    normalized = dict(item)
+    normalized["symbol"] = str(normalized.get("symbol", "")).strip()
+    normalized["exchange"] = str(normalized.get("exchange", "")).upper()
+    normalized["token"] = str(normalized.get("token", ""))
+    normalized["level"] = float(normalized.get("level", 0.0))
+    normalized["enabled"] = bool(normalized.get("enabled", True))
+    normalized["activated"] = bool(normalized.get("activated", True))
+    normalized["ltp"] = normalized.get("ltp")
+    return normalized
+
+
 def load_tokens():
     if not TOKENS_FILE.exists():
         return []
@@ -34,7 +59,14 @@ def load_tokens():
         return []
     if not isinstance(tokens, list):
         raise ValueError("token file must contain a JSON list")
-    return tokens
+    normalized_tokens = []
+    for item in tokens:
+        normalized = normalize_token_entry(item)
+        normalized.setdefault("enabled", True)
+        normalized.setdefault("activated", True)
+        normalized.setdefault("ltp", None)
+        normalized_tokens.append(normalized)
+    return normalized_tokens
 
 
 def save_tokens(tokens):
@@ -161,14 +193,91 @@ table { width: 100%; border-collapse: collapse; margin-top: 24px; } th, td { tex
 <div class="actions"><button type="submit">ADD TOKEN</button><button formaction="{{ url_for('save_expiry_route') }}">SAVE EXPIRY</button></div>
 </form>
 <p>Generated symbol: <strong>{{ symbol }}</strong>{% if result %} | {{ result }}{% endif %}</p>
-<table><tr><th>Symbol</th><th>Exchange</th><th>Token</th><th>Level</th><th>Command</th><th></th></tr>
-{% for item in tokens %}<tr><td>{{ item.symbol }}</td><td>{{ item.exchange }}</td><td>{{ item.token }}</td><td>{{ item.level }}</td><td>ADD {{ item.symbol }} {{ item.exchange }} {{ item.token }} {{ item.level }}</td><td><form class="inline" method="post" action="{{ url_for('remove') }}"><input type="hidden" name="symbol" value="{{ item.symbol }}"><input type="hidden" name="exchange" value="{{ item.exchange }}"><input type="hidden" name="token" value="{{ item.token }}"><input type="hidden" name="level" value="{{ item.level }}"><button class="remove">REMOVE</button></form></td></tr>{% endfor %}
+<table>
+  <thead><tr><th>Symbol</th><th>Exchange</th><th>Token</th><th>Level</th><th>Ltp</th><th>Enabled</th><th>Activated</th><th></th></tr></thead>
+  <tbody id="token-table-body">
+    {% for item in tokens %}<tr><td>{{ item.symbol }}</td><td>{{ item.exchange }}</td><td>{{ item.token }}</td><td>{{ item.level }}</td><td class="ltp-cell">{{ item.get('ltp', '') }}</td><td><form class="inline" method="post" action="{{ url_for('toggle_status') }}"><input type="hidden" name="symbol" value="{{ item.symbol }}"><input type="hidden" name="exchange" value="{{ item.exchange }}"><input type="hidden" name="token" value="{{ item.token }}"><input type="hidden" name="level" value="{{ item.level }}"><input type="hidden" name="field" value="enabled"><button>{% if item.enabled %}Disable{% else %}Enable{% endif %}</button></form></td><td><form class="inline" method="post" action="{{ url_for('toggle_status') }}"><input type="hidden" name="symbol" value="{{ item.symbol }}"><input type="hidden" name="exchange" value="{{ item.exchange }}"><input type="hidden" name="token" value="{{ item.token }}"><input type="hidden" name="level" value="{{ item.level }}"><input type="hidden" name="field" value="activated"><button>{% if item.activated %}Deactivate{% else %}Activate{% endif %}</button></form></td><td><form class="inline" method="post" action="{{ url_for('remove') }}"><input type="hidden" name="symbol" value="{{ item.symbol }}"><input type="hidden" name="exchange" value="{{ item.exchange }}"><input type="hidden" name="token" value="{{ item.token }}"><input type="hidden" name="level" value="{{ item.level }}"><button class="remove">REMOVE</button></form></td></tr>{% endfor %}
+  </tbody>
 </table>
 <script>
 const expiryValues = {{ expiry_values|tojson }};
 function updateExpiry(instrument) {
     document.getElementById("expiry").value = expiryValues[instrument] || "";
 }
+
+function formatLtp(value) {
+    if (value === null || value === undefined || value === '') {
+        return '';
+    }
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue.toFixed(2) : value;
+}
+
+function renderTokenRows(tokens) {
+    const tbody = document.getElementById('token-table-body');
+    if (!tbody) return;
+    tbody.innerHTML = tokens.map((item) => {
+        const symbol = item.symbol || '';
+        const exchange = item.exchange || '';
+        const token = item.token || '';
+        const level = item.level ?? '';
+        const ltp = formatLtp(item.ltp);
+        const enabled = item.enabled !== false;
+        const activated = item.activated !== false;
+        return `
+            <tr>
+                <td>${symbol}</td>
+                <td>${exchange}</td>
+                <td>${token}</td>
+                <td>${level}</td>
+                <td class="ltp-cell">${ltp}</td>
+                <td>
+                    <form class="inline" method="post" action="/toggle-status">
+                        <input type="hidden" name="symbol" value="${symbol}">
+                        <input type="hidden" name="exchange" value="${exchange}">
+                        <input type="hidden" name="token" value="${token}">
+                        <input type="hidden" name="level" value="${level}">
+                        <input type="hidden" name="field" value="enabled">
+                        <button>${enabled ? 'Disable' : 'Enable'}</button>
+                    </form>
+                </td>
+                <td>
+                    <form class="inline" method="post" action="/toggle-status">
+                        <input type="hidden" name="symbol" value="${symbol}">
+                        <input type="hidden" name="exchange" value="${exchange}">
+                        <input type="hidden" name="token" value="${token}">
+                        <input type="hidden" name="level" value="${level}">
+                        <input type="hidden" name="field" value="activated">
+                        <button>${activated ? 'Deactivate' : 'Activate'}</button>
+                    </form>
+                </td>
+                <td>
+                    <form class="inline" method="post" action="/remove">
+                        <input type="hidden" name="symbol" value="${symbol}">
+                        <input type="hidden" name="exchange" value="${exchange}">
+                        <input type="hidden" name="token" value="${token}">
+                        <input type="hidden" name="level" value="${level}">
+                        <button class="remove">REMOVE</button>
+                    </form>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+const tokenStream = new EventSource('/stream');
+tokenStream.addEventListener('tokens', (event) => {
+    try {
+        const tokens = JSON.parse(event.data);
+        renderTokenRows(tokens);
+    } catch (error) {
+        console.error('Token stream parse error:', error);
+    }
+});
+tokenStream.onerror = () => {
+    console.warn('Token stream reconnecting...');
+};
+renderTokenRows({{ tokens|tojson }});
 </script>
 """
 
@@ -199,6 +308,26 @@ def home():
     return page_values()
 
 
+@app.get("/api/tokens")
+def api_tokens():
+    return jsonify(load_tokens())
+
+
+@app.get("/stream")
+def stream_tokens():
+    def generate():
+        while True:
+            payload = json.dumps(load_tokens())
+            yield f"event: tokens\ndata: {payload}\n\n"
+            time.sleep(3)
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
+
+
 @app.post("/add")
 def add():
     try:
@@ -216,7 +345,16 @@ def add():
         token, found_symbol, found_exchange = rows[0]
         exchange = found_exchange.upper()
         tokens = load_tokens()
-        item = {"symbol": found_symbol, "exchange": exchange, "token": str(token), "level": level}
+        item = {
+            "symbol": found_symbol,
+            "exchange": exchange,
+            "token": str(token),
+            "level": level,
+            "enabled": True,
+            "activated": True,
+            "ltp": None,
+        }
+        item = normalize_token_entry(item)
         if item not in tokens:
             tokens.append(item)
             save_tokens(tokens)
@@ -237,10 +375,85 @@ def save_expiry_route():
 @app.post("/remove")
 def remove():
     tokens = load_tokens()
-    target = {"symbol": request.form["symbol"], "exchange": request.form["exchange"], "token": request.form["token"], "level": float(request.form["level"])}
-    tokens[:] = [item for item in tokens if item != target]
+    symbol = request.form["symbol"]
+    exchange = request.form["exchange"]
+    token = request.form["token"]
+    level = float(request.form["level"])
+    tokens[:] = [
+        item for item in tokens
+        if not (
+            item.get("symbol") == symbol
+            and item.get("exchange", "").upper() == exchange.upper()
+            and str(item.get("token")) == token
+            and float(item.get("level")) == level
+        )
+    ]
     save_tokens(tokens)
     return redirect(url_for("home"))
+
+
+@app.post("/toggle-status")
+def toggle_status():
+    try:
+        symbol = request.form["symbol"]
+        exchange = request.form["exchange"]
+        token = request.form["token"]
+        level = float(request.form["level"])
+        field = request.form["field"]
+        if field not in {"enabled", "activated"}:
+            raise ValueError("Invalid field.")
+        tokens = load_tokens()
+        target = next(
+            (item for item in tokens if item["symbol"] == symbol and item["exchange"] == exchange and item["token"] == token and float(item["level"]) == level),
+            None,
+        )
+        if target:
+            target[field] = not target[field]
+            save_tokens(tokens)
+        return redirect(url_for("home"))
+    except (KeyError, ValueError) as error:
+        return page_values(message=str(error))
+
+
+@app.post("/api/update-status")
+def api_update_status():
+    try:
+        data = request.get_json()
+        if data is None:
+            raise ValueError("JSON body is required.")
+        symbol = data["symbol"]
+        exchange = data["exchange"].upper()
+        token = str(data["token"])
+        level = float(data["level"])
+        field = data["field"]
+        value = data["value"]
+        if field == "activated":
+            return {
+                "status": "error",
+                "message": "Activate/Deactivate is managed only from the UI.",
+            }, 403
+        if field not in {"enabled", "ltp"}:
+            raise ValueError("Invalid field.")
+        tokens = load_tokens()
+        target = next(
+            (item for item in tokens if item.get("symbol") == symbol and item.get("exchange", "").upper() == exchange and str(item.get("token")) == token and float(item.get("level")) == level),
+            None,
+        )
+        if target is None:
+            target = next(
+                (item for item in tokens if item.get("exchange", "").upper() == exchange and str(item.get("token")) == token),
+                None,
+            )
+        if target:
+            if field == "enabled":
+                target[field] = bool(value)
+            else:
+                target["ltp"] = float(value)
+            save_tokens(tokens)
+            return {"status": "ok", "message": f"{field} set to {value}"}, 200
+        return {"status": "error", "message": "Token not found"}, 404
+    except (KeyError, ValueError, TypeError) as error:
+        return {"status": "error", "message": str(error)}, 400
 
 
 if __name__ == "__main__":
