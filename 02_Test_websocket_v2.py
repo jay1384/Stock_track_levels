@@ -370,6 +370,7 @@ def evaluate_crossing(exchange_type, token, price):
                         )
                 elif previous is not None and enabled and activated:
                     if previous <= level < price:
+                        Take_entry_in_trade(token,"UP",price,symbol)
                         print(f"UP {exchange_name} {token} | price={price:.2f} level={level:.2f}")
                         state["armed"] = False
                         level_item["enabled"] = False
@@ -377,6 +378,7 @@ def evaluate_crossing(exchange_type, token, price):
                         call_api_update(symbol, exchange_name, token, level, "enabled", False)
                         call_api_update(symbol, exchange_name, token, level, "activated", False)
                     elif previous >= level > price:
+                        Take_entry_in_trade(token,"DOWN",price,symbol)
                         print(f"DOWN {exchange_name} {token} | price={price:.2f} level={level:.2f}")
                         state["armed"] = False
                         level_item["enabled"] = False
@@ -461,8 +463,36 @@ def token_file_loop():
         sync_token_list()
         time.sleep(1)
 
+def get_the_ATM_strike(token, price, direction, symbol):
+    # Calculate the ATM strike based on the price
+    if(token=="99926000"):
+        expected_strike = round(price / 50) * 50
+        if(direction=="UP"):
+            expected_strike = expected_strike + 50
+            call_put = "PE"
+        elif(direction=="DOWN"):
+            expected_strike = expected_strike - 50
+            call_put = "CE"
+    elif(token=="99919000"):
+        expected_strike = round(price / 100) * 100
+        if(direction=="UP"):
+            expected_strike = expected_strike + 100 
+            call_put = "PE"
+        elif(direction=="DOWN"):
+            expected_strike = expected_strike - 100
+            call_put = "CE"
+    else:
+        print("This index does not have ATM strike calculation logic implemented.")
+        expected_strike = None   
+    print(f"ATM Strike calculated for {symbol}: {expected_strike}")
+    return expected_strike
 
-# ============================================================
+def Take_entry_in_trade(token,direction,price,symbol):
+    print(f"TRADE ENTRY: Token {token} Direction {direction} Price {price} Symbol {symbol}")
+    expected_strike = get_the_ATM_strike(token,price, direction,symbol)
+    print(f"Expected Strike for {symbol}: {expected_strike}")
+
+
 # WEBSOCKET CALLBACK - ERROR
 # ============================================================
 
