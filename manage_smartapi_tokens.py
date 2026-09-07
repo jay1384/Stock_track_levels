@@ -1,10 +1,15 @@
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, stream_with_context, url_for
 import json
 import os
+import pyotp
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 
 app = Flask(__name__)
@@ -34,6 +39,36 @@ DEFAULT_EXPIRY = {
     "Crudeoil": "Crude_exp",
 }
 DEFAULT_EXCHANGE = {"Nifty": "NSE", "Sensex": "BSE", "Crudeoil": "MCX"}
+token_file_lock = threading.RLock()
+
+API_KEY = "btT0lqAK"
+CLIENT_CODE = "AACC089277"
+PASSWORD = "7536"
+TOTP_SECRET = "WADAPVNHVCMWFW3GWRGDV2L5R4"
+REARM_THRESHOLDS = {
+    "NSE": 5, "BSE": 10, "NFO": 50, "BFO": 50,
+    "MCX": 50, "NCX": 50, "CDE": 50,
+}
+EXCHANGE_MAP = {
+    "NSE": SmartWebSocketV2.NSE_CM,
+    "NFO": SmartWebSocketV2.NSE_FO,
+    "BSE": SmartWebSocketV2.BSE_CM,
+    "BFO": SmartWebSocketV2.BSE_FO,
+    "MCX": SmartWebSocketV2.MCX_FO,
+    "NCX": SmartWebSocketV2.NCX_FO,
+    "CDE": SmartWebSocketV2.CDE_FO,
+}
+EXCHANGE_NAME_MAP = {value: key for key, value in EXCHANGE_MAP.items()}
+smart_api = None
+sws = None
+websocket_connected = False
+token_lock = threading.Lock()
+subscribed_tokens = {}
+latest_prices = {}
+crossing_states = {}
+token_levels = {}
+last_token_file_signature = None
+websocket_thread = None
 
 
 def normalize_token_entry(item):
@@ -70,20 +105,28 @@ def load_tokens():
 
 
 def save_tokens(tokens):
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix="smartapi_tokens_", suffix=".json", dir=BASE_DIR, text=True
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            json.dump(tokens, file, indent=2)
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary_name, TOKENS_FILE)
-    except Exception:
-        if os.path.exists(temporary_name):
-            os.remove(temporary_name)
-        raise
+    with token_file_lock:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="smartapi_tokens_", suffix=".json", dir=BASE_DIR, text=True
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                json.dump(tokens, file, indent=2)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            for attempt in range(3):
+                try:
+                    os.replace(temporary_name, TOKENS_FILE)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        except Exception:
+            if os.path.exists(temporary_name):
+                os.remove(temporary_name)
+            raise
 
 
 def create_expiry_db():
@@ -344,20 +387,21 @@ def add():
             return page_values(request.form, result=f"{len(rows)} matches found for {symbol}.")
         token, found_symbol, found_exchange = rows[0]
         exchange = found_exchange.upper()
-        tokens = load_tokens()
-        item = {
-            "symbol": found_symbol,
-            "exchange": exchange,
-            "token": str(token),
-            "level": level,
-            "enabled": True,
-            "activated": True,
-            "ltp": None,
-        }
-        item = normalize_token_entry(item)
-        if item not in tokens:
-            tokens.append(item)
-            save_tokens(tokens)
+        with token_file_lock:
+            tokens = load_tokens()
+            item = {
+                "symbol": found_symbol,
+                "exchange": exchange,
+                "token": str(token),
+                "level": level,
+                "enabled": True,
+                "activated": True,
+                "ltp": None,
+            }
+            item = normalize_token_entry(item)
+            if item not in tokens:
+                tokens.append(item)
+                save_tokens(tokens)
         return page_values(request.form, message=f"Command sent: ADD {found_symbol} {exchange} {token} {level}", result="Token added.")
     except (KeyError, ValueError, OSError, sqlite3.Error) as error:
         return page_values(request.form, message=str(error))
@@ -374,21 +418,22 @@ def save_expiry_route():
 
 @app.post("/remove")
 def remove():
-    tokens = load_tokens()
-    symbol = request.form["symbol"]
-    exchange = request.form["exchange"]
-    token = request.form["token"]
-    level = float(request.form["level"])
-    tokens[:] = [
-        item for item in tokens
-        if not (
-            item.get("symbol") == symbol
-            and item.get("exchange", "").upper() == exchange.upper()
-            and str(item.get("token")) == token
-            and float(item.get("level")) == level
-        )
-    ]
-    save_tokens(tokens)
+    with token_file_lock:
+        tokens = load_tokens()
+        symbol = request.form["symbol"]
+        exchange = request.form["exchange"]
+        token = request.form["token"]
+        level = float(request.form["level"])
+        tokens[:] = [
+            item for item in tokens
+            if not (
+                item.get("symbol") == symbol
+                and item.get("exchange", "").upper() == exchange.upper()
+                and str(item.get("token")) == token
+                and float(item.get("level")) == level
+            )
+        ]
+        save_tokens(tokens)
     return redirect(url_for("home"))
 
 
@@ -402,17 +447,47 @@ def toggle_status():
         field = request.form["field"]
         if field not in {"enabled", "activated"}:
             raise ValueError("Invalid field.")
-        tokens = load_tokens()
-        target = next(
-            (item for item in tokens if item["symbol"] == symbol and item["exchange"] == exchange and item["token"] == token and float(item["level"]) == level),
-            None,
-        )
-        if target:
-            target[field] = not target[field]
-            save_tokens(tokens)
+        with token_file_lock:
+            tokens = load_tokens()
+            target = next(
+                (item for item in tokens if item["symbol"] == symbol and item["exchange"] == exchange and item["token"] == token and float(item["level"]) == level),
+                None,
+            )
+            if target:
+                target[field] = not target[field]
+                save_tokens(tokens)
         return redirect(url_for("home"))
     except (KeyError, ValueError) as error:
         return page_values(message=str(error))
+
+
+def update_token_record(symbol, exchange, token, level, field, value):
+    if field == "activated":
+        return {"status": "error", "message": "Activate/Deactivate is managed only from the UI."}, 403
+    if field not in {"enabled", "ltp"}:
+        raise ValueError("Invalid field.")
+    with token_file_lock:
+        tokens = load_tokens()
+        target = next(
+            (item for item in tokens
+             if item.get("symbol") == symbol
+             and item.get("exchange", "").upper() == exchange.upper()
+             and str(item.get("token")) == str(token)
+             and float(item.get("level")) == float(level)),
+            None,
+        )
+        if target is None:
+            target = next(
+                (item for item in tokens
+                 if item.get("exchange", "").upper() == exchange.upper()
+                 and str(item.get("token")) == str(token)),
+                None,
+            )
+        if target is None:
+            return {"status": "error", "message": "Token not found"}, 404
+        target[field] = bool(value) if field == "enabled" else float(value)
+        save_tokens(tokens)
+    return {"status": "ok", "message": f"{field} set to {value}"}, 200
 
 
 @app.post("/api/update-status")
@@ -421,40 +496,241 @@ def api_update_status():
         data = request.get_json()
         if data is None:
             raise ValueError("JSON body is required.")
-        symbol = data["symbol"]
-        exchange = data["exchange"].upper()
-        token = str(data["token"])
-        level = float(data["level"])
-        field = data["field"]
-        value = data["value"]
-        if field == "activated":
-            return {
-                "status": "error",
-                "message": "Activate/Deactivate is managed only from the UI.",
-            }, 403
-        if field not in {"enabled", "ltp"}:
-            raise ValueError("Invalid field.")
-        tokens = load_tokens()
-        target = next(
-            (item for item in tokens if item.get("symbol") == symbol and item.get("exchange", "").upper() == exchange and str(item.get("token")) == token and float(item.get("level")) == level),
-            None,
+        return update_token_record(
+            data["symbol"], data["exchange"], data["token"],
+            data["level"], data["field"], data["value"],
         )
-        if target is None:
-            target = next(
-                (item for item in tokens if item.get("exchange", "").upper() == exchange and str(item.get("token")) == token),
-                None,
-            )
-        if target:
-            if field == "enabled":
-                target[field] = bool(value)
-            else:
-                target["ltp"] = float(value)
-            save_tokens(tokens)
-            return {"status": "ok", "message": f"{field} set to {value}"}, 200
-        return {"status": "error", "message": "Token not found"}, 404
     except (KeyError, ValueError, TypeError) as error:
         return {"status": "error", "message": str(error)}, 400
 
 
+def login():
+    global smart_api
+    smart_api = SmartConnect(API_KEY)
+    session = smart_api.generateSession(
+        CLIENT_CODE, PASSWORD, pyotp.TOTP(TOTP_SECRET).now()
+    )
+    if not session or session.get("status") is False:
+        raise RuntimeError(f"SmartAPI login failed: {session}")
+    return session["data"]["jwtToken"], smart_api.getfeedToken()
+
+
+def load_token_list():
+    return load_tokens()
+
+
+def call_api_update(symbol, exchange, token, level, field, value):
+    try:
+        update_token_record(symbol, exchange, token, level, field, value)
+    except Exception as error:
+        print(f"Token update error: {error}")
+
+
+def on_open(_wsapp):
+    global websocket_connected
+    websocket_connected = True
+    print("SmartAPI websocket connected")
+
+
+def on_error(_wsapp, error):
+    global websocket_connected
+    websocket_connected = False
+    print(f"SmartAPI websocket error: {error}")
+
+
+def on_close(_wsapp):
+    global websocket_connected
+    websocket_connected = False
+    print("SmartAPI websocket closed")
+
+
+def on_data(_wsapp, message):
+    try:
+        exchange_type = message.get("exchange_type")
+        token = str(message.get("token"))
+        ltp = float(message["last_traded_price"]) / 100.0
+        exchange_name = EXCHANGE_NAME_MAP.get(exchange_type, str(exchange_type))
+        with token_lock:
+            latest_prices[(exchange_type, token)] = ltp
+        token_record = next(
+            (item for item in load_token_list()
+             if item["exchange"] == exchange_name and item["token"] == token),
+            None,
+        )
+        if token_record:
+            call_api_update(token_record["symbol"], exchange_name, token,
+                            token_record["level"], "ltp", ltp)
+        evaluate_crossing(exchange_type, token, ltp)
+    except Exception as error:
+        print(f"Error processing tick: {error}; raw message: {message}")
+
+
+def evaluate_crossing(exchange_type, token, price):
+    exchange_name = EXCHANGE_NAME_MAP.get(exchange_type, str(exchange_type))
+    threshold = REARM_THRESHOLDS.get(exchange_name, 50)
+    with token_lock:
+        for level_item in token_levels.get((exchange_type, token), []):
+            level = level_item["level"]
+            state = crossing_states.setdefault(
+                (exchange_type, token, level),
+                {"previous": None, "armed": True, "disabled_since": None},
+            )
+            previous = state["previous"]
+            enabled = level_item.get("enabled", True)
+            activated = level_item.get("activated", True)
+            if previous is None:
+                level_item["enabled"] = abs(price - level) > threshold
+                state["disabled_since"] = None if level_item["enabled"] else price
+                call_api_update(level_item["symbol"], exchange_name, token, level,
+                                "enabled", level_item["enabled"])
+            elif not enabled and state.get("disabled_since") is not None:
+                if abs(price - level) > threshold:
+                    level_item["enabled"] = True
+                    state["disabled_since"] = None
+                    call_api_update(level_item["symbol"], exchange_name, token,
+                                    level, "enabled", True)
+            elif activated and enabled:
+                direction = None
+                if previous <= level < price:
+                    direction = "UP"
+                elif previous >= level > price:
+                    direction = "DOWN"
+                if direction:
+                    take_entry_in_trade(token, direction, price, level_item["symbol"])
+                    level_item["enabled"] = False
+                    level_item["activated"] = False
+                    state["disabled_since"] = price
+                    call_api_update(level_item["symbol"], exchange_name, token,
+                                    level, "enabled", False)
+                    call_api_update(level_item["symbol"], exchange_name, token,
+                                    level, "activated", False)
+            state["previous"] = price
+
+
+def get_atm_strike(token, price, direction, symbol):
+    if token == "99926000":
+        increment = 50
+    elif token == "99919000":
+        increment = 100
+    else:
+        print(f"ATM strike calculation is not implemented for {symbol}")
+        return None
+    strike = round(price / increment) * increment
+    strike += increment if direction == "UP" else -increment
+    print(f"ATM strike calculated for {symbol}: {strike}")
+    return strike
+
+
+def take_entry_in_trade(token, direction, price, symbol):
+    print(f"TRADE ENTRY: token={token} direction={direction} price={price} symbol={symbol}")
+    get_atm_strike(token, price, direction, symbol)
+
+
+def add_token(exchange_name, token):
+    if not websocket_connected or exchange_name.upper() not in EXCHANGE_MAP:
+        return
+    exchange_type = EXCHANGE_MAP[exchange_name.upper()]
+    token = str(token)
+    with token_lock:
+        if token in subscribed_tokens.get(exchange_type, set()):
+            return
+        sws.subscribe(
+            correlation_id=f"ADD{int(time.time() * 1000)}",
+            mode=SmartWebSocketV2.LTP_MODE,
+            token_list=[{"exchangeType": exchange_type, "tokens": [token]}],
+        )
+        subscribed_tokens.setdefault(exchange_type, set()).add(token)
+
+
+def remove_token(exchange_name, token):
+    if not websocket_connected or exchange_name.upper() not in EXCHANGE_MAP:
+        return
+    exchange_type = EXCHANGE_MAP[exchange_name.upper()]
+    token = str(token)
+    with token_lock:
+        if token not in subscribed_tokens.get(exchange_type, set()):
+            return
+        sws.unsubscribe(
+            correlation_id=f"REM{int(time.time() * 1000)}",
+            mode=SmartWebSocketV2.LTP_MODE,
+            token_list=[{"exchangeType": exchange_type, "tokens": [token]}],
+        )
+        subscribed_tokens[exchange_type].remove(token)
+        if not subscribed_tokens[exchange_type]:
+            del subscribed_tokens[exchange_type]
+
+
+def sync_token_list():
+    global last_token_file_signature
+    if not websocket_connected:
+        return
+    tokens = load_token_list()
+    signature = json.dumps(tokens, sort_keys=True)
+    if signature == last_token_file_signature:
+        return
+    last_token_file_signature = signature
+    desired = {(EXCHANGE_MAP[item["exchange"]], item["token"]) for item in tokens}
+    with token_lock:
+        token_levels.clear()
+        for item in tokens:
+            key = (EXCHANGE_MAP[item["exchange"]], item["token"])
+            token_levels.setdefault(key, []).append(item)
+        current = {
+            (exchange_type, token)
+            for exchange_type, values in subscribed_tokens.items()
+            for token in values
+        }
+    for exchange_type, token in desired - current:
+        add_token(EXCHANGE_NAME_MAP[exchange_type], token)
+    for exchange_type, token in current - desired:
+        remove_token(EXCHANGE_NAME_MAP[exchange_type], token)
+
+
+def token_file_loop():
+    while True:
+        try:
+            sync_token_list()
+        except Exception as error:
+            print(f"Token synchronization error: {error}")
+        time.sleep(1)
+
+
+def print_prices_loop():
+    while True:
+        time.sleep(10)
+        try:
+            with token_lock:
+                prices = dict(latest_prices)
+            for item in load_token_list():
+                exchange_type = EXCHANGE_MAP[item["exchange"]]
+                price = prices.get((exchange_type, item["token"]), "waiting")
+                print(f"{item['exchange']} | {item['symbol']} | {item['token']} | LTP = {price}")
+        except Exception as error:
+            print(f"Price report error: {error}")
+
+
+def start_websocket():
+    global sws, websocket_thread
+    if websocket_thread is not None and websocket_thread.is_alive():
+        return
+    auth_token, feed_token = login()
+    sws = SmartWebSocketV2(
+        auth_token=auth_token, api_key=API_KEY, client_code=CLIENT_CODE,
+        feed_token=feed_token, max_retry_attempt=5, retry_strategy=0,
+        retry_delay=5, retry_duration=30,
+    )
+    sws.on_open = on_open
+    sws.on_data = on_data
+    sws.on_error = on_error
+    sws.on_close = on_close
+    websocket_thread = threading.Thread(
+        target=sws.connect, name="smartapi-websocket", daemon=True
+    )
+    websocket_thread.start()
+    threading.Thread(target=token_file_loop, name="token-file-sync", daemon=True).start()
+    threading.Thread(target=print_prices_loop, name="price-report", daemon=True).start()
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5002, use_reloader=False)
+    start_websocket()
+    app.run(debug=True, port=5002, threaded=True, use_reloader=False)
